@@ -1,0 +1,6 @@
+Name,Age,City,Email,Salary
+ Alice ,25, Bengaluru,alice@example.com,50000
+Bob,30,Mysuru ,bob@example.com,60000
+bob,30,mysuru,bob@example.com,60000
+Charlie,,Mangalore,charlie@example.com,55000
+Alice,25, Bengaluru,alice@example.com,50000
