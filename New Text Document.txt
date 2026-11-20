@@ -1,0 +1,206 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import io, json, re
+from datetime import datetime
+
+st.set_page_config(page_title="DataFix AI", page_icon="🛠️", layout="wide")
+
+st.markdown("""<style>
+.main {background-color: #f7f9fc;}
+[data-testid='stMetric'] {background: white; padding: 14px; border-radius: 12px; border: 1px solid #e8edf3;}
+</style>""", unsafe_allow_html=True)
+
+st.title("🛠️ DataFix AI")
+st.caption("Autonomous Data Quality & Repair Engine | Upload • Detect • Diagnose • Repair • Validate • Track")
+
+
+def load_file(uploaded):
+    if uploaded.name.lower().endswith('.csv'):
+        return pd.read_csv(uploaded)
+    return pd.read_excel(uploaded)
+
+
+def detect_issues(df):
+    issues = []
+    missing_total = int(df.isna().sum().sum())
+    dup_total = int(df.duplicated().sum())
+    if missing_total:
+        issues.append({"Issue": "Missing values", "Count": missing_total, "Details": "Blank or null cells", "Severity": "Medium"})
+    if dup_total:
+        issues.append({"Issue": "Duplicate rows", "Count": dup_total, "Details": "Rows identical across all columns", "Severity": "Medium"})
+    for col in df.columns:
+        s = df[col]
+        if s.dtype == 'object' or pd.api.types.is_string_dtype(s):
+            nonnull = s.dropna().astype(str)
+            whitespace = int((nonnull != nonnull.str.strip()).sum())
+            if whitespace:
+                issues.append({"Issue": f"Whitespace in {col}", "Count": whitespace, "Details": "Leading/trailing spaces", "Severity": "Low"})
+            # suspicious mixed capitalization in categorical-like columns
+            if len(nonnull) and nonnull.nunique() <= max(30, int(len(nonnull)*0.4)):
+                normalized = nonnull.str.strip().str.lower()
+                variants = int(nonnull.str.strip().nunique() - normalized.nunique())
+                if variants > 0:
+                    issues.append({"Issue": f"Inconsistent text in {col}", "Count": variants, "Details": "Case variants may represent the same category", "Severity": "Low"})
+        if pd.api.types.is_numeric_dtype(s):
+            x = s.dropna()
+            if len(x) >= 4:
+                q1, q3 = x.quantile(.25), x.quantile(.75)
+                iqr = q3 - q1
+                outliers = int(((x < q1-1.5*iqr) | (x > q3+1.5*iqr)).sum()) if iqr != 0 else 0
+                if outliers:
+                    issues.append({"Issue": f"Possible outliers in {col}", "Count": outliers, "Details": "IQR rule (flagged, not automatically changed)", "Severity": "Review"})
+    return pd.DataFrame(issues, columns=["Issue", "Count", "Details", "Severity"])
+
+
+def repair_data(original, fill_missing=True, normalize_text=True, remove_duplicates=True):
+    df = original.copy()
+    log = []
+    # Trim text whitespace and normalize categorical text variants conservatively
+    if normalize_text:
+        for col in df.select_dtypes(include=['object', 'string']).columns:
+            before = df[col].copy()
+            df[col] = df[col].map(lambda x: x.strip() if isinstance(x, str) else x)
+            trimmed = int((before.fillna('__NA__').astype(str) != df[col].fillna('__NA__').astype(str)).sum())
+            if trimmed:
+                log.append({"Column": col, "Action": "Trim whitespace", "Rows affected": trimmed, "Confidence": "High", "Reason": "Removed leading/trailing spaces"})
+            # Only case-fold columns with modest cardinality; preserve original values in high-cardinality text columns
+            nonnull = df[col].dropna().astype(str)
+            if len(nonnull) and nonnull.nunique() <= max(30, int(len(nonnull)*0.4)):
+                folded = df[col].map(lambda x: x.lower() if isinstance(x, str) else x)
+                # Case normalization only if it actually reduces unique values
+                if df[col].dropna().astype(str).nunique() > folded.dropna().astype(str).nunique():
+                    affected = int((df[col].fillna('__NA__').astype(str) != folded.fillna('__NA__').astype(str)).sum())
+                    df[col] = folded
+                    log.append({"Column": col, "Action": "Normalize category casing", "Rows affected": affected, "Confidence": "Medium", "Reason": "Lowercase normalization merged case-only variants"})
+    if fill_missing:
+        for col in df.columns:
+            count = int(df[col].isna().sum())
+            if not count:
+                continue
+            if pd.api.types.is_numeric_dtype(df[col]):
+                fill_value = df[col].median()
+                if pd.notna(fill_value):
+                    df[col] = df[col].fillna(fill_value)
+                    log.append({"Column": col, "Action": "Fill missing numeric values", "Rows affected": count, "Confidence": "Medium", "Reason": f"Filled with median ({fill_value})"})
+            else:
+                modes = df[col].mode(dropna=True)
+                if len(modes):
+                    fill_value = modes.iloc[0]
+                    df[col] = df[col].fillna(fill_value)
+                    log.append({"Column": col, "Action": "Fill missing categorical values", "Rows affected": count, "Confidence": "Medium", "Reason": f"Filled with most frequent value ({fill_value})"})
+                else:
+                    log.append({"Column": col, "Action": "Skipped missing-value repair", "Rows affected": count, "Confidence": "Low", "Reason": "No non-missing value available to infer a fill value"})
+    if remove_duplicates:
+        count = int(df.duplicated().sum())
+        if count:
+            df = df.drop_duplicates().reset_index(drop=True)
+            log.append({"Column": "All columns", "Action": "Remove duplicate rows", "Rows affected": count, "Confidence": "High", "Reason": "Exact duplicate rows removed; first occurrence retained"})
+    return df, pd.DataFrame(log, columns=["Column", "Action", "Rows affected", "Confidence", "Reason"])
+
+
+def quality_score(df):
+    if df.shape[0] == 0 or df.shape[1] == 0:
+        return 0
+    total_cells = df.shape[0] * df.shape[1]
+    missing = int(df.isna().sum().sum())
+    dup = int(df.duplicated().sum())
+    # weighted, transparent score: missing cells and duplicate rows reduce score
+    score = 100 - (missing / total_cells * 70) - (dup / max(df.shape[0], 1) * 30)
+    return round(max(0, min(100, score)), 1)
+
+
+with st.sidebar:
+    st.header("⚙️ Repair settings")
+    fill_missing = st.checkbox("Repair missing values", value=True)
+    normalize_text = st.checkbox("Trim and normalize text", value=True)
+    remove_duplicates = st.checkbox("Remove exact duplicate rows", value=True)
+    st.info("Outliers are detected and reported, but not automatically altered to avoid damaging valid data.")
+
+uploaded = st.file_uploader("Upload your dataset (CSV or Excel)", type=["csv", "xlsx", "xls"])
+if uploaded is None:
+    st.markdown("### 👋 Start by uploading a dataset")
+    st.markdown("Or try the built-in sample dataset below.")
+    sample = pd.DataFrame({
+        "Name": [" Alice ", "Bob", "bob", "Charlie", "Alice"],
+        "Age": [25, 30, 30, np.nan, 25],
+        "City": [" Bengaluru", "Mysuru ", "mysuru", None, " Bengaluru"],
+        "Email": ["alice@example.com", "bob@example.com", "bob@example.com", "charlie@example.com", "alice@example.com"],
+        "Salary": [50000, 60000, 60000, 55000, 50000]
+    })
+    if st.button("Load sample dataset", type="primary"):
+        st.session_state['sample_df'] = sample
+    if 'sample_df' not in st.session_state:
+        st.stop()
+    raw_df = st.session_state['sample_df'].copy()
+else:
+    try:
+        raw_df = load_file(uploaded)
+    except Exception as e:
+        st.error(f"Could not read this file: {e}")
+        st.stop()
+
+if raw_df.empty:
+    st.warning("This dataset is empty.")
+    st.stop()
+
+st.subheader("📄 Original dataset")
+st.dataframe(raw_df.head(100), use_container_width=True)
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Rows", f"{raw_df.shape[0]:,}")
+c2.metric("Columns", f"{raw_df.shape[1]:,}")
+c3.metric("Missing cells", f"{int(raw_df.isna().sum().sum()):,}")
+c4.metric("Duplicate rows", f"{int(raw_df.duplicated().sum()):,}")
+
+st.subheader("🔎 Detection & diagnosis")
+issues_df = detect_issues(raw_df)
+if issues_df.empty:
+    st.success("No issues detected by the current checks.")
+else:
+    st.dataframe(issues_df, use_container_width=True, hide_index=True)
+
+missing_by_col = raw_df.isna().sum().reset_index()
+missing_by_col.columns = ["Column", "Missing"]
+if missing_by_col["Missing"].sum() > 0:
+    st.plotly_chart(px.bar(missing_by_col, x="Column", y="Missing", title="Missing values by column"), use_container_width=True)
+
+st.subheader("🧰 Repair")
+if st.button("Run DataFix repair", type="primary", use_container_width=True):
+    repaired, log_df = repair_data(raw_df, fill_missing, normalize_text, remove_duplicates)
+    st.session_state['repaired_df'] = repaired
+    st.session_state['repair_log'] = log_df
+    st.session_state['original_df'] = raw_df.copy()
+
+if 'repaired_df' in st.session_state:
+    repaired = st.session_state['repaired_df']
+    log_df = st.session_state['repair_log']
+    original = st.session_state['original_df']
+    st.subheader("✅ Validation & results")
+    q1, q2, q3 = st.columns(3)
+    q1.metric("Before quality score", f"{quality_score(original)} / 100")
+    q2.metric("After quality score", f"{quality_score(repaired)} / 100")
+    q3.metric("Rows after repair", f"{repaired.shape[0]:,}")
+    scores = pd.DataFrame({"Stage": ["Before repair", "After repair"], "Score": [quality_score(original), quality_score(repaired)]})
+    st.plotly_chart(px.bar(scores, x="Stage", y="Score", range_y=[0,100], title="Data quality score comparison"), use_container_width=True)
+    st.markdown("#### Repaired dataset")
+    st.dataframe(repaired.head(100), use_container_width=True)
+    st.markdown("#### Repair audit log")
+    if log_df.empty:
+        st.info("No modifications were necessary under the selected settings.")
+    else:
+        st.dataframe(log_df, use_container_width=True, hide_index=True)
+    post_issues = detect_issues(repaired)
+    st.markdown("#### Remaining issues")
+    if post_issues.empty:
+        st.success("No issues detected by the current checks after repair.")
+    else:
+        st.dataframe(post_issues, use_container_width=True, hide_index=True)
+    csv_bytes = repaired.to_csv(index=False).encode('utf-8')
+    st.download_button("⬇️ Download cleaned CSV", data=csv_bytes, file_name="datafix_cleaned.csv", mime="text/csv", use_container_width=True)
+    log_csv = log_df.to_csv(index=False).encode('utf-8')
+    st.download_button("⬇️ Download repair log", data=log_csv, file_name="datafix_repair_log.csv", mime="text/csv", use_container_width=True)
+
+st.markdown("---")
+st.caption("DataFix AI prototype • Repairs are rule-based and explainable. Review inferred changes before using cleaned data in production.")
